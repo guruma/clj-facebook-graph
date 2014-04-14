@@ -1,117 +1,203 @@
-; Copyright (c) Maximilian Weber. All rights reserved.
-; The use and distribution terms for this software are covered by the
-; Eclipse Public License 1.0 (http://opensource.org/licenses/eclipse-1.0.php)
-; which can be found in the file epl-v10.html at the root of this distribution.
-; By using this software in any fashion, you are agreeing to be bound by
-; the terms of this license.
-; You must not remove this notice, or any other, from this software.
+(ns vita.facebook
+  (:require [ring.util.codec :as codec]
+            [ring.util.response :as res :refer [redirect response]]
+            [ring.middleware.keyword-params :as param :refer [wrap-keyword-params]]
+            [uri.core :as uri]
+            [clojure.data.json :as json]
+            [clj-oauth2.client :as oauth2]
+            [pandect.core :as pan]
+            [hiccup.core :as hiccup :refer [html]]
+            [clj-http.client :as http]
+            [clj-time [core :as time]
+                      [format :as timef]
+                      [local :as local]]))
 
-(ns clj-facebook-graph.ring-middleware
-  "Middleware for Ring to realize a simple Facebook authentication."
-  (:use [clj-facebook-graph.helper :only [build-url]]
-        [clj-facebook-graph.auth :only [get-access-token with-facebook-auth make-auth-request]]
-        [ring.util.response :only [redirect]]
-        [ring.middleware.keyword-params])
-  (:import clj_facebook_graph.FacebookGraphException))
+(defn not-nil? [a]
+  (not (nil? a)))
 
-(defn add-facebook-auth
-  "Adds the facebook-auth information (includes the access token) to the ring session."
-  [session access-token]
-  (assoc session :facebook-auth {:access-token access-token}))
+(defn debug [& args]
+  (println (apply str args)))
 
-(defn wrap-facebook-extract-callback-code
-  "Extracts the code from the request which the Facebook Graph API appends as query
-   parameter in the case of an successful authentication to the redirect_uri. It's
-   flexible so that every URL and not only the login URL of your web application
-   can be the redirect_uri of the Facebook authentication process.
-   A redirect is triggered to the redirect_uri with out the code query parameter
-   to get rid of the 'code' parameter in the web browser of your user, thereby the
-   access token is associated with the user's session.
-   An example:
+;;----------------------------------------------------
+;; config info for facebook.
+;;----------------------------------------------------
 
-   You have a path in your web application like:
-   http://www.yourwebapp.com/albums/1511
+(def facebook-login-dialog-path "https://www.facebook.com/dialog/oauth?")
 
-   which displays the albums of a Facebook friend with the id 1511 of your user
-   (also a Facebook user). For this reason your application needs a Facebook access token
-   on behalf of your user to get access to the albums of the user's friend.
-   After the user has successfully logged into Facebook, Facebook redirects the user back
-   to your specified redirect_uri (in this case 'http://www.yourwebapp.com/albums/1511')
-   with a query parameter 'code' appended. This code can be used by your web application to
-   get an Facebook access token. So here the web browser of your user comes back
-   from Facebook to the following URL of your application:
+(defn- fb-uri [path]
+  (str "https://graph.facebook.com" path))
 
-   http://www.yourwebapp.com/albums/1511?code=123-example-code
+(def facebook-oauth2-endpoint
+  {:access-query-param :access_token
+   :authorization-uri (fb-uri "/oauth/authorize")
+   :access-token-uri (fb-uri "/oauth/access_token")})
 
-   This middleware extracts the code and use it to receive an access token from Facebook. Then
-   it triggers a redirect to:
+(def app-info {
+  :app-id "your app id"
+  :app-secret-code "your app sectrt code"
+  :redirect-uri "https://localhost/vita-login/"
+  :canvas-page-uri "https://apps.facebook.com/latte-dev"
+  :game-uri "https://localhost/"
+  :user-app-login-path "your app login path"
+  :grant-type "authorization_code"
+  :scope  ["read_friendlists","read_stream","publish_actions","user_photos"]
+})
 
-   http://www.yourwebapp.com/albums/1511
+(let [{:keys [app-id app-secret-code redirect-uri grant-type] :as app} app-info]
+  (def facebook-endpoint
+    (merge facebook-oauth2-endpoint
+           (assoc app :client-id app-id :client-secret app-secret-code :redirect-uri redirect-uri))))
 
-   To get rid of the 'code' query parameter in the browser of your user. In the same step the
-   received access token is associated with the user's session in your web application.
+;;----------------------------------------------------
+;; signed request
+;;----------------------------------------------------
 
-   Pay attention that you have specified the correct :redirect-uri in your facebook-app-info
-   otherwise this middleware can not detect if the request is a redirect for the Facebook
-   authentication or just a request with a code query parameter.
-   "
-  [handler facebook-app-info callback-handler]
-  (fn [request]
-    (let [code (get-in request [:params "code"])
-          callback-path (.getPath (java.net.URI. (:redirect-uri facebook-app-info)))]
-      (if (and code (= callback-path (:uri request)))
-        (let [params (:params ((wrap-keyword-params identity) request))
-              access-token (get-access-token facebook-app-info
-                                             params
-                                             (get-in request [:session :facebook-auth-request]))
-              session (add-facebook-auth (:session request) access-token)
-              session (dissoc session :facebook-auth-request)
-              return-to (:return-to session)
-              session (dissoc session :return-to)]
-          (if return-to
-            (assoc (redirect return-to) :session session)
-            (callback-handler request)))
-        (handler request)))))
+(defn- bytes->string [bytes]
+  (apply str (map char bytes)))
 
-(defn wrap-facebook-access-token-required
-  "If the middleware for Facebook access through clj-http throws a FacebookGraphException
-   which was caused by an OAuthException error then this peace of Ring middleware triggers a
-   redirect to the Facebook authentication page. The following OAuthException errors are
-   handled at the moment:
-     - :invalid-access-token - The access token which is used by your application is invalid,
-                               mostly it is expired.
-     - :access-token-required - At the moment your application has not been using an access
-                               at all to do Facebook Graph API requests, so your user have to
-                               do a Facebook login first. 
-   See #'wrap-facebook-extract-callback-code for an example request flow.
-   If you need a Facebook at any point of the Ring request processing, you can throw
-   a FacebookGraphException with the following error: {:error :facebook-login-required}."
-  [handler facebook-app-info]
-  (let [auth-errors #{[:OAuthException :invalid-access-token]
-                      [:OAuthException :access-token-required]}]
-    (fn [request]
-      (try
-        (handler request)
-        (catch FacebookGraphException e
-          (if (let [error (:error @e)] (or (auth-errors error)
-                                           (= :facebook-login-required error)))
-            (let [session (if (= :get (:request-method request))
-                            (assoc (:session request) :return-to (build-url request))
-                            (:session request))
-                  redirect-uri (:uri (make-auth-request facebook-app-info))]
-              ;; we might want to pass a second argument to make-auth-request here to prevent CSRF.
-              ;; this would have to be stored in the session (see wrap-facebook-extract-callback-code)
-              (assoc (redirect redirect-uri)
-                :session session))
-            (throw e)))))))
+(defn- base64url-decode [xs]
+  (-> xs
+      (.replace "/" "_")
+      (.replace "-" "+")
+      codec/base64-decode))
 
-(defn wrap-facebook-auth [handler facebook-app-info login-path]
-  "Binds the facebook-auth (access-token) information to the thread bounded *facebook-auth*
-   variable (by using with-facebook-auth) so it can be used by the Ring-style middleware
-   for clj-http to access the Facebook Graph API."
-  (fn [request]
-    (if (and (= :get (:request-method request)) (= login-path (:uri request)))
-      (redirect (:uri (make-auth-request facebook-app-info)))
-      (if-let [facebook-auth (get-in request [:session :facebook-auth])]
-        (with-facebook-auth facebook-auth (handler request))
-        (handler request)))))
+(defn- parse-signed-request
+  "parse the signed request from facebook app link."
+  [signed-request]
+  (println "------------- parse-signed-request ---------------")
+;;   (println signed-request)
+  (let [[encoded-sig payload] (.split signed-request "\\.")
+        sig (base64url-decode encoded-sig)
+        data (-> payload base64url-decode bytes->string json/read-json)
+        expected-sig (pan/sha256-hmac-bytes payload (:app-secret-code app-info))]
+;;     (if (java.util.Arrays/equals sig expected-sig)
+;;     (println "sig = " (String. sig) ", exprected-sig = " (String. expected-sig))
+    (debug data)
+    (if (= (String. sig) (String. expected-sig))
+      data
+      (println "vita error in parse signed-request."))))
+
+
+;;----------------------------------------------------
+;; facebook request check predicates
+;;----------------------------------------------------
+
+(defn- logined-user?
+  "check for user to be facebook loggined."
+  [data]
+  (let [r (and (:oauth_token data)
+               (:user_id data))]
+    (debug "------------- facebook logined-user? " (not-nil? r) "---------------")
+    r))
+
+(defn- facebook-signed-request?
+  "a predicate to check for facebook singed request from game link."
+  [req]
+  (let [r (and (= :post (:request-method req))
+               (not-nil? (get-in req [:params "signed_request"])))]
+    (debug "------------- facebook-signed-request? " r "-------------")
+    r))
+
+(defn- request-for-app-login? [req]
+  (let [r (and (= :get (:request-method req))
+               (= (:uri req) (:user-app-login-path app-info) ))]
+;;                (= (:uri req) (.getPath (java.net.URI. (:redirect-uri app-info)))))
+    (debug "------------- request-for-app-login? " r "---------------")
+    r))
+
+(defn- request-redirected-from-facebook-login-dialog?
+  "페이스북 Login Dialog로부터 redirect된 request인지 검사"
+  [req]
+  (let [r (and (request-for-app-login? req)
+               (not-nil? (get-in req [:params "code"])))]
+    (debug "------------- request-from-facebook-login-dialog? " r "---------------")
+    r ))
+
+;;----------------------------------------------------
+;; redirections
+;;----------------------------------------------------
+
+(defn- make-state-string-for-facebook-login []
+  (str (java.util.UUID/randomUUID)))
+
+(defn- redirect-in-iframe [uri]
+  (debug "------------- redirect-in-iframe ---------------")
+  (let [url (html [:html [:body [:script {:type "text/javascript"}
+                                 (str "window.parent.top.location.href=\"" uri "\";")]]])]
+  (debug url)
+  {:status 200
+   :headers {"Content-Type" "text/html"}
+   :body url}))
+
+(defn- redirect-user-to-facebook-login-dialog [request]
+  (debug "------------- redirect-user-to-facebook-login-dialog -------------")
+  (let [state (make-state-string-for-facebook-login)
+        login-uri (:uri (oauth2/make-auth-request facebook-endpoint state))]
+    (debug login-uri)
+    (redirect-in-iframe login-uri )))
+
+(defn- exchange-code-for-access-token [req params]
+  (:access-token (oauth2/get-access-token
+                  facebook-endpoint
+                  params
+                  {:state (:state params) :scope nil})))
+
+(defn- get-facebook-user-info [token]
+  (let [params {"fields" "id,name,email,username,picture"}
+        params (assoc params "access_token" token)
+        req {:query-params params}]
+    (json/read-json (:body (http/get (str (fb-uri "/me")) req)))))
+
+(defn- redirect-user-to-canvas-page []
+  (debug "------------- redirect-user-to-canvas-page ---------------")
+  (redirect-in-iframe (:canvas-page-uri app-info)))
+
+(defn- redirect-user-to-game [access-token]
+  (debug "------------- redirect-user-to-game -------------")
+    (let [fb-user-info (get-facebook-user-info access-token)]
+      (debug fb-user-info)
+      (redirect (:game-uri app-info))))
+
+(defn- exchange-code-for-access-token [params]
+  (:access-token (oauth2/get-access-token
+                  facebook-endpoint
+                  params
+                  {:state (:state params) :scope nil})))
+
+(defn- response-error [params]
+  (let [error-code (params "error_code")]
+    (response "access denied")))
+
+;;----------------------------------------------------
+;; ring middleware
+;;----------------------------------------------------
+
+(defn facebook-request
+  "a ring middleware to process facebook requests for game login and redirect url."
+  [req]
+  (debug "------------- REQUEST ---------------")
+  (debug (:request-method req))
+  (debug (:uri req))
+  (debug (:params req))
+  (cond
+   (request-redirected-from-facebook-login-dialog? req)
+   (redirect-user-to-canvas-page)
+
+   (request-for-app-login? req)
+   (if (get-in req [:params "error"])
+     (response-error (:params req))
+     (redirect-user-to-facebook-login-dialog req))
+
+   (facebook-signed-request? req)
+   (let [login-data (parse-signed-request (get-in req [:params "signed_request"]))]
+     (if (logined-user? login-data)
+       (redirect-user-to-game (:oauth_token login-data))
+       (redirect-user-to-facebook-login-dialog req)))))
+
+(defn wrap-facebook
+  "a wrapper function for a facebook middleware."
+  [handler]
+  (fn [req]
+    (debug "\n=============  WRAP FACEBOOK HANDLER ==================")
+    (or (facebook-request req)
+        (handler req))))

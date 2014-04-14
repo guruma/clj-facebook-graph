@@ -13,6 +13,7 @@
         [ring.middleware.session :only [wrap-session]]
         [ring.middleware.session.memory :only [memory-store]]
         [ring.handler.dump :only [handle-dump]]
+;;         [ring.mock.request]
         [clj-facebook-graph.auth :only [with-facebook-auth with-facebook-access-token make-auth-request *facebook-auth*]]
         [clj-facebook-graph.helper :only [facebook-base-url]]
         [clj-facebook-graph.ring-middleware :only [wrap-facebook-access-token-required
@@ -25,6 +26,7 @@
             [clj-facebook-graph.client :as client])
   (:import [java.lang Exception]
            [clj_facebook_graph FacebookGraphException]))
+
 
 (def name-id-map (atom {}))
 
@@ -93,7 +95,7 @@
 
 (def session-store (atom {}))
 
-(defn wrap-app [app facebook-app-info] 
+(defn wrap-app [app facebook-app-info]
   (-> app
       (wrap-facebook-auth facebook-app-info "/facebook-login")
       (wrap-facebook-extract-callback-code facebook-app-info handle-dump)
@@ -104,8 +106,24 @@
 
 (def the-app (wrap-app app facebook-app-info))
 
+(def req1
+{:ssl-client-cert nil, :remote-addr "221.150.124.66", :scheme :http,
+ :query-params {"fb_bmpos" "1_0", "count" "0", "ref" "bookmarks", "fb_source" "bookmark"},
+ :form-params {"fb_locale" "ko_KR", "signed_request" "aaaa"},
+ :multipart-params {}, :request-method :get,
+ :query-string "fb_source=bookmark&ref=bookmarks&count=0&fb_bmpos=1_0",
+ :content-type "application/x-www-form-urlencoded",
+ :uri "/facebook-callback", :server-name "localhost",
+ :params {"code" "code",  "fb_source" "bookmark", "ref" "bookmarks", "count" "0", "fb_bmpos" "1_0", "signed_request" "aaa", "fb_locale" "ko_KR"},
+ :headers {"user-agent" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.9; rv:27.0) Gecko/20100101 Firefox/27.0", "cookie" "JSESSIONID=A6F26C5086B08EA50FBBBBC99F3463E3; ring-session=8a3cdd3d-48b6-421d-b5de-6bf35f9063ec", "accept" "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "host" "weebinar.com", "referer" "https://apps.facebook.com/latte-dev/?fb_source=bookmark&ref=bookmarks&count=0&fb_bmpos=1_0", "content-type" "application/x-www-form-urlencoded", "accept-encoding" "gzip, deflate", "content-length" "589", "accept-language" "ko-kr,ko;q=0.8,en-us;q=0.5,en;q=0.3", "connection" "keep-alive"},
+ :content-length 589, :server-port 8080, :character-encoding nil,
+ :body ""})
+
+(the-app req1)
+
 (defn start-server []
   (future (run-jetty (var the-app) {:port 8080 :join? false})))
+
 
 ;(def server (start-server))
 ;(.stop (.get server))
