@@ -1,4 +1,4 @@
-(ns vita.facebook
+(ns clj-facebook-graph.ring-middleware
   (:require [ring.util.codec :as codec]
             [ring.util.response :as res :refer [redirect response]]
             [ring.middleware.keyword-params :as param :refer [wrap-keyword-params]]
